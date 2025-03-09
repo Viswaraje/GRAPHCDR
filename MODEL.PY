@@ -1,37 +1,18 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import global_max_pool as gmp, global_mean_pool
-from torch_geometric.nn import GATv2Conv  # Using GATv2Conv instead of GATConv
-from torch_scatter import scatter_mean
+from torch_geometric.nn import GATConv
+from base_model.SGConv import SGConv
 from torch.nn import Parameter
-import numpy as np
+from my_utiils import *
 
 EPS = 1e-15
-
-def reset(nn):
-    def _reset(item):
-        if hasattr(item, 'reset_parameters'):
-            item.reset_parameters()
-    if nn is not None:
-        if hasattr(nn, 'children') and len(list(nn.children())) > 0:
-            for item in nn.children():
-                _reset(item)
-        else:
-            _reset(nn)
-
-def glorot(tensor):
-    if tensor is not None:
-        stdv = math.sqrt(6.0 / (tensor.size(-2) + tensor.size(-1)))
-        tensor.data.uniform_(-stdv, stdv)
-
-
 class NodeRepresentation(nn.Module):
-    def __init__(self, gcn_layer, dim_gexp, dim_methy, output, units_list=[256, 256, 256], 
-                 use_relu=True, use_bn=True, use_GMP=True, use_mutation=True, 
-                 use_gexpr=True, use_methylation=True, dropout=0.2, num_heads=4):
+    def __init__(self, gcn_layer, dim_gexp, dim_methy, output, units_list=[256, 256, 256], use_relu=True, use_bn=True,
+                 use_GMP=True, use_mutation=True, use_gexpr=True, use_methylation=True):
         super(NodeRepresentation, self).__init__()
         torch.manual_seed(0)
+        # -------drug layers
         self.use_relu = use_relu
         self.use_bn = use_bn
         self.units_list = units_list
@@ -39,218 +20,173 @@ class NodeRepresentation(nn.Module):
         self.use_mutation = use_mutation
         self.use_gexpr = use_gexpr
         self.use_methylation = use_methylation
-        self.dropout = dropout
-        self.num_heads = num_heads
-        
-        # Using GATv2Conv instead of GATConv for dynamic attention
-        self.conv1 = GATv2Conv(gcn_layer, units_list[0] // num_heads, heads=num_heads, dropout=dropout)
+        # Replace SGConv with GATConv for the first layer
+        self.conv1 = GATConv(gcn_layer, units_list[0])
         self.batch_conv1 = nn.BatchNorm1d(units_list[0])
-        self.graph_conv = nn.ModuleList()
-        self.graph_bn = nn.ModuleList()
-        
+        self.graph_conv = nn.ModuleList()  # Changed from list to ModuleList
+        self.graph_bn = nn.ModuleList()    # Changed from list to ModuleList
         for i in range(len(units_list) - 1):
-            self.graph_conv.append(
-                GATv2Conv(units_list[i], units_list[i + 1] // num_heads, heads=num_heads, dropout=dropout)
-            )
-            self.graph_bn.append(nn.BatchNorm1d(units_list[i + 1]))
-        
-        self.conv_end = GATv2Conv(units_list[-1], output // num_heads, heads=num_heads, dropout=dropout)
+            # Replace SGConv with GATConv in all graph layers
+            self.graph_conv.append(GATConv(units_list[i], units_list[i + 1]))
+            self.graph_bn.append(nn.BatchNorm1d((units_list[i + 1])))
+        # Replace final SGConv with GATConv
+        self.conv_end = GATConv(units_list[-1], output)
         self.batch_end = nn.BatchNorm1d(output)
-        
-        # Cell line layers with dropout
-        self.fc_gexp1 = nn.Linear(dim_gexp, 512)
-        self.batch_gexp1 = nn.BatchNorm1d(512)
-        self.fc_gexp2 = nn.Linear(512, 256)
-        self.batch_gexp2 = nn.BatchNorm1d(256)
-        self.fc_gexp3 = nn.Linear(256, output)
-        
-        self.fc_methy1 = nn.Linear(dim_methy, 512)
-        self.batch_methy1 = nn.BatchNorm1d(512)
-        self.fc_methy2 = nn.Linear(512, 256)
-        self.batch_methy2 = nn.BatchNorm1d(256)
-        self.fc_methy3 = nn.Linear(256, output)
-        
-        # Improved CNN architecture for mutation data
-        self.cov1 = nn.Conv2d(1, 64, (1, 7), stride=(1, 3))
-        self.bn_cov1 = nn.BatchNorm2d(64)
-        self.cov2 = nn.Conv2d(64, 32, (1, 5), stride=(1, 2))
-        self.bn_cov2 = nn.BatchNorm2d(32)
+        # --------cell line layers (three omics)
+        # -------gexp_layer
+        self.fc_gexp1 = nn.Linear(dim_gexp, 256)
+        self.batch_gexp1 = nn.BatchNorm1d(256)
+        self.fc_gexp2 = nn.Linear(256, output)
+        # -------methy_layer
+        self.fc_methy1 = nn.Linear(dim_methy, 256)
+        self.batch_methy1 = nn.BatchNorm1d(256)
+        self.fc_methy2 = nn.Linear(256, output)
+        # -------mut_layer
+        self.cov1 = nn.Conv2d(1, 50, (1, 700), stride=(1, 5))
+        self.cov2 = nn.Conv2d(50, 30, (1, 5), stride=(1, 2))
         self.fla_mut = nn.Flatten()
-        self.fc_mut1 = nn.Linear(2144, 512)  # Adjusted size based on new conv layers
-        self.bn_mut1 = nn.BatchNorm1d(512)
-        self.fc_mut2 = nn.Linear(512, output)
-        
-        # Feature combination layers
-        self.fcat = nn.Linear(300, 200)
-        self.bn_fcat = nn.BatchNorm1d(200)
-        self.fcat2 = nn.Linear(200, output)
-        self.batchc = nn.BatchNorm1d(output)
-        
-        # Dropout layers
-        self.dropout_layer = nn.Dropout(dropout)
-        
+        self.fc_mut = nn.Linear(2010, output)
+        # ------Concatenate_three omics
+        self.fcat = nn.Linear(300, output)
+        self.batchc = nn.BatchNorm1d(100)
         self.reset_para()
 
     def reset_para(self):
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+        return
 
     def forward(self, drug_feature, drug_adj, ibatch, mutation_data, gexpr_data, methylation_data):
-        # Drug graph processing with improved GAT
-        x_drug = self.conv1(drug_feature, drug_adj)
-        x_drug = F.leaky_relu(x_drug, negative_slope=0.2)
-        x_drug = self.dropout_layer(x_drug)
+        # Modified to handle edge_index format for GAT
+        # Convert adjacency matrix to edge_index for GAT
+        num_nodes = drug_feature.size(0)
+        
+        # Safe edge_index conversion with bounds checking
+        if isinstance(drug_adj, torch.Tensor) and len(drug_adj.shape) == 2:
+            # Make sure adj matrix dimensions match feature dimensions
+            if drug_adj.shape[0] > num_nodes or drug_adj.shape[1] > num_nodes:
+                # Need to crop the adjacency matrix
+                drug_adj = drug_adj[:num_nodes, :num_nodes]
+                
+            edge_index = torch.nonzero(drug_adj).t().contiguous()
+            
+            # Safety check - filter out any edge indices that are out of bounds
+            valid_edges_mask = (edge_index[0] < num_nodes) & (edge_index[1] < num_nodes)
+            edge_index = edge_index[:, valid_edges_mask]
+        else:
+            # If drug_adj is already an edge_index (PyG format)
+            edge_index = drug_adj
+            # Safety check - filter out any edge indices that are out of bounds
+            valid_edges_mask = (edge_index[0] < num_nodes) & (edge_index[1] < num_nodes)
+            edge_index = edge_index[:, valid_edges_mask]
+        
+        # Ensure edge_index is not empty
+        if edge_index.numel() == 0:
+            # Create a self-loop for each node as a fallback
+            edge_index = torch.stack([torch.arange(num_nodes), torch.arange(num_nodes)], dim=0).to(drug_feature.device)
+       
+        # -----drug representation
+        x_drug = self.conv1(drug_feature, edge_index)
+        x_drug = F.relu(x_drug)
         x_drug = self.batch_conv1(x_drug)
-        
         for i in range(len(self.units_list) - 1):
-            x_drug = self.graph_conv[i](x_drug, drug_adj)
-            x_drug = F.leaky_relu(x_drug, negative_slope=0.2)
-            x_drug = self.dropout_layer(x_drug)
+            x_drug = self.graph_conv[i](x_drug, edge_index)
+            x_drug = F.relu(x_drug)
             x_drug = self.graph_bn[i](x_drug)
-        
-        x_drug = self.conv_end(x_drug, drug_adj)
-        x_drug = F.leaky_relu(x_drug, negative_slope=0.2)
+        x_drug = self.conv_end(x_drug, edge_index)
+        x_drug = F.relu(x_drug)
         x_drug = self.batch_end(x_drug)
-        
-        # Global pooling with residual connection
         if self.use_GMP:
-            x_drug_mean = global_mean_pool(x_drug, ibatch)
-            x_drug_max = gmp(x_drug, ibatch)
-            x_drug = x_drug_mean + x_drug_max
+            x_drug = gmp(x_drug, ibatch)
         else:
             x_drug = global_mean_pool(x_drug, ibatch)
-        
-        # Omics data processing with deeper networks
-        outputs = []
-        
+            
+        # -----cell line representation
+        # -----mutation representation
         if self.use_mutation:
-            x_mutation = self.cov1(mutation_data)
-            x_mutation = self.bn_cov1(x_mutation)
-            x_mutation = F.leaky_relu(x_mutation, negative_slope=0.2)
-            x_mutation = F.max_pool2d(x_mutation, (1, 3))
-            x_mutation = self.dropout_layer(x_mutation)
-            
-            x_mutation = self.cov2(x_mutation)
-            x_mutation = self.bn_cov2(x_mutation)
-            x_mutation = F.leaky_relu(x_mutation, negative_slope=0.2)
-            x_mutation = F.max_pool2d(x_mutation, (1, 3))
-            x_mutation = self.dropout_layer(x_mutation)
-            
+            x_mutation = torch.tanh(self.cov1(mutation_data))
+            x_mutation = F.max_pool2d(x_mutation, (1, 5))
+            x_mutation = F.relu(self.cov2(x_mutation))
+            x_mutation = F.max_pool2d(x_mutation, (1, 10))
             x_mutation = self.fla_mut(x_mutation)
-            x_mutation = self.fc_mut1(x_mutation)
-            x_mutation = self.bn_mut1(x_mutation)
-            x_mutation = F.leaky_relu(x_mutation, negative_slope=0.2)
-            x_mutation = self.dropout_layer(x_mutation)
-            x_mutation = self.fc_mut2(x_mutation)
-            
-            outputs.append(x_mutation)
+            x_mutation = F.relu(self.fc_mut(x_mutation))
+            # x_mutation = torch.dropout(x_mutation, 0.1, train=False)
 
+        # ----gexpr representation
         if self.use_gexpr:
-            x_gexpr = self.fc_gexp1(gexpr_data)
+            x_gexpr = torch.tanh(self.fc_gexp1(gexpr_data))
             x_gexpr = self.batch_gexp1(x_gexpr)
-            x_gexpr = F.leaky_relu(x_gexpr, negative_slope=0.2)
-            x_gexpr = self.dropout_layer(x_gexpr)
-            
-            x_gexpr = self.fc_gexp2(x_gexpr)
-            x_gexpr = self.batch_gexp2(x_gexpr)
-            x_gexpr = F.leaky_relu(x_gexpr, negative_slope=0.2)
-            x_gexpr = self.dropout_layer(x_gexpr)
-            
-            x_gexpr = self.fc_gexp3(x_gexpr)
-            
-            outputs.append(x_gexpr)
+            # x_gexpr = torch.dropout(x_gexpr,0.1, train=False)
+            x_gexpr = F.relu(self.fc_gexp2(x_gexpr))
 
+        # ----methylation representation
         if self.use_methylation:
-            x_methylation = self.fc_methy1(methylation_data)
+            x_methylation = torch.tanh(self.fc_methy1(methylation_data))
             x_methylation = self.batch_methy1(x_methylation)
-            x_methylation = F.leaky_relu(x_methylation, negative_slope=0.2)
-            x_methylation = self.dropout_layer(x_methylation)
-            
-            x_methylation = self.fc_methy2(x_methylation)
-            x_methylation = self.batch_methy2(x_methylation)
-            x_methylation = F.leaky_relu(x_methylation, negative_slope=0.2)
-            x_methylation = self.dropout_layer(x_methylation)
-            
-            x_methylation = self.fc_methy3(x_methylation)
-            
-            outputs.append(x_methylation)
+            # x_methylation = torch.dropout(x_methylation, 0.1, train=False)
+            x_methylation = F.relu(self.fc_methy2(x_methylation))
 
-        if outputs:
-            x_cell = torch.cat(outputs, 1)
-            x_cell = self.fcat(x_cell)
-            x_cell = self.bn_fcat(x_cell)
-            x_cell = F.leaky_relu(x_cell, negative_slope=0.2)
-            x_cell = self.dropout_layer(x_cell)
-            x_cell = self.fcat2(x_cell)
+        # ------Concatenate representations of three omics
+        if self.use_gexpr==False:
+            x_cell = torch.cat((x_mutation, x_methylation), 1)
+        elif self.use_mutation==False:
+            x_cell = torch.cat((x_gexpr, x_methylation), 1)
+        elif self.use_methylation == False:
+            x_cell = torch.cat((x_mutation, x_gexpr), 1)
         else:
-            x_cell = torch.zeros(drug_feature.size(0), self.hidden_size, device=drug_feature.device)
+            x_cell = torch.cat((x_mutation, x_gexpr, x_methylation), 1)
+        x_cell = F.relu(self.fcat(x_cell))
         
+        #combine representations of cell line and drug
         x_all = torch.cat((x_cell, x_drug), 0)
         x_all = self.batchc(x_all)
         return x_all
 
-
-class GATv2Encoder(nn.Module):
-    def __init__(self, in_channels, hidden_channels, num_heads=4, dropout=0.2):
-        super(GATv2Encoder, self).__init__()
-        self.conv1 = GATv2Conv(in_channels, hidden_channels // num_heads, heads=num_heads, dropout=dropout)
+class Encoder(nn.Module):
+    def __init__(self, in_channels, hidden_channels):
+        super(Encoder, self).__init__()
+        # Replace GCNConv with GATConv
+        self.conv1 = GATConv(in_channels, hidden_channels)
         self.prelu1 = nn.PReLU(hidden_channels)
-        self.conv2 = GATv2Conv(hidden_channels, hidden_channels // num_heads, heads=num_heads, dropout=dropout)
-        self.prelu2 = nn.PReLU(hidden_channels)
-        self.dropout = nn.Dropout(dropout)
-
+        # Commented part also modified if needed
+        # self.conv2 = GATConv(hidden_channels, hidden_channels)
+        # self.prelu2 = nn.PReLU(hidden_channels)
     def forward(self, x, edge_index):
+        # Safety check for edge_index
+        num_nodes = x.size(0)
+        valid_edges_mask = (edge_index[0] < num_nodes) & (edge_index[1] < num_nodes)
+        edge_index = edge_index[:, valid_edges_mask]
+        
+        # Ensure edge_index is not empty
+        if edge_index.numel() == 0:
+            # Create a self-loop for each node as a fallback
+            edge_index = torch.stack([torch.arange(num_nodes), torch.arange(num_nodes)], dim=0).to(x.device)
+            
         x = self.conv1(x, edge_index)
         x = self.prelu1(x)
-        x = self.dropout(x)
-        x = self.conv2(x, edge_index)
-        x = self.prelu2(x)
+        # x = self.conv2(x, edge_index)
+        # x = self.prelu2(x)
         return x
 
-
-class AttentionSummary(nn.Module):
+class Summary(nn.Module):
     def __init__(self, ino, inn):
-        super(AttentionSummary, self).__init__()
-        self.fc1 = nn.Linear(ino + inn, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.fc2 = nn.Linear(256, 64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.fc3 = nn.Linear(64, 1)
-        self.dropout = nn.Dropout(0.2)
+        super(Summary, self).__init__()
+        self.fc1 = nn.Linear(ino + inn, 1)
 
     def forward(self, xo, xn):
-        # Multi-layer attention mechanism
-        m = torch.cat((xo, xn), 1)
-        m = self.fc1(m)
-        m = self.bn1(m)
-        m = F.leaky_relu(m, negative_slope=0.2)
-        m = self.dropout(m)
-        
-        m = self.fc2(m)
-        m = self.bn2(m)
-        m = F.leaky_relu(m, negative_slope=0.2)
-        m = self.dropout(m)
-        
-        m = self.fc3(m)
+        m = self.fc1(torch.cat((xo, xn), 1))
         m = torch.tanh(torch.squeeze(m))
-        
-        # Softmax attention weights
-        attention = F.softmax(m, dim=0)
-        
-        # Weighted sum
-        x = torch.matmul(attention, xn)
+        m = torch.exp(m) / (torch.exp(m)).sum()
+        x = torch.matmul(m, xn)
         return x
 
 
-class ImprovedGraphCDR(nn.Module):
-    def __init__(self, hidden_channels, encoder, summary, feat, index, dropout=0.2):
-        super(ImprovedGraphCDR, self).__init__()
+class GraphCDR(nn.Module):
+    def __init__(self, hidden_channels, encoder, summary, feat, index):
+        super(GraphCDR, self).__init__()
         self.hidden_channels = hidden_channels
         self.encoder = encoder
         self.summary = summary
@@ -258,88 +194,67 @@ class ImprovedGraphCDR(nn.Module):
         self.index = index
         self.weight = Parameter(torch.Tensor(hidden_channels, hidden_channels))
         self.act = nn.Sigmoid()
-        
-        # Deeper prediction layers
-        self.fc = nn.Linear(100, 64)
-        self.bn_fc = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 10)
-        
-        self.fd = nn.Linear(100, 64)
-        self.bn_fd = nn.BatchNorm1d(64)
-        self.fd2 = nn.Linear(64, 10)
-        
-        # Layer normalization for better training stability
-        self.layer_norm = nn.LayerNorm(hidden_channels)
-        
-        # Dropout for regularization
-        self.dropout = nn.Dropout(dropout)
-        
+        self.fc = nn.Linear(100, 10)
+        self.fd = nn.Linear(100, 10)
         self.reset_parameters()
 
     def reset_parameters(self):
         reset(self.encoder)
         reset(self.summary)
-        nn.init.xavier_uniform_(self.weight)
+        glorot(self.weight)
         for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if isinstance(m, (nn.Linear)):
+                nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
     def forward(self, drug_feature, drug_adj, ibatch, mutation_data, gexpr_data, methylation_data, edge):
-        # CDR graph edge and corrupted CDR graph edge
+        #---CDR_graph_edge and corrupted CDR_graph_edge
         pos_edge = torch.from_numpy(edge[edge[:, 2] == 1, 0:2].T)
         neg_edge = torch.from_numpy(edge[edge[:, 2] == -1, 0:2].T)
         
-        # Cell+drug node attributes
+        #---cell+drug node attributes
         feature = self.feat(drug_feature, drug_adj, ibatch, mutation_data, gexpr_data, methylation_data)
         
-        # Cell+drug embedding from the CDR graph and the corrupted CDR graph
+        # Safety check for edge indices
+        num_nodes = feature.size(0)
+        
+        # Filter valid edges for pos_edge
+        valid_pos_mask = (pos_edge[0] < num_nodes) & (pos_edge[1] < num_nodes)
+        pos_edge = pos_edge[:, valid_pos_mask]
+        
+        # Filter valid edges for neg_edge
+        valid_neg_mask = (neg_edge[0] < num_nodes) & (neg_edge[1] < num_nodes)
+        neg_edge = neg_edge[:, valid_neg_mask]
+        
+        # Ensure edges are not empty
+        if pos_edge.numel() == 0:
+            pos_edge = torch.stack([torch.arange(num_nodes), torch.arange(num_nodes)], dim=0).to(feature.device)
+        if neg_edge.numel() == 0:
+            neg_edge = torch.stack([torch.arange(num_nodes), torch.arange(num_nodes)], dim=0).to(feature.device)
+        
+        #---cell+drug embedding from the CDR graph and the corrupted CDR graph
         pos_z = self.encoder(feature, pos_edge)
         neg_z = self.encoder(feature, neg_edge)
         
-        # Layer normalization for stable training
-        pos_z = self.layer_norm(pos_z)
-        neg_z = self.layer_norm(neg_z)
-        
-        # Apply dropout for regularization
-        pos_z = self.dropout(pos_z)
-        neg_z = self.dropout(neg_z)
-        
-        # Graph-level embedding (summary)
+        #---graph-level embedding (summary)
         summary_pos = self.summary(feature, pos_z)
         summary_neg = self.summary(feature, neg_z)
         
-        # Embedding at layer l
-        cellpos = pos_z[:self.index, ]
-        drugpos = pos_z[self.index:, ]
+        #---embedding at layer l
+        cellpos = pos_z[:self.index, ]; drugpos = pos_z[self.index:, ]
         
-        # Embedding at layer 0 with deeper networks
-        cell_features = feature[:self.index, ]
-        drug_features = feature[self.index:, ]
+        #---embedding at layer 0
+        cellfea = self.fc(feature[:self.index, ]); drugfea = self.fd(feature[self.index:, ])
+        cellfea = torch.sigmoid(cellfea); drugfea = torch.sigmoid(drugfea)
         
-        cellfea = self.fc(cell_features)
-        cellfea = self.bn_fc(cellfea)
-        cellfea = F.leaky_relu(cellfea, negative_slope=0.2)
-        cellfea = self.dropout(cellfea)
-        cellfea = self.fc2(cellfea)
-        cellfea = torch.sigmoid(cellfea)
-        
-        drugfea = self.fd(drug_features)
-        drugfea = self.bn_fd(drugfea)
-        drugfea = F.leaky_relu(drugfea, negative_slope=0.2)
-        drugfea = self.dropout(drugfea)
-        drugfea = self.fd2(drugfea)
-        drugfea = torch.sigmoid(drugfea)
-        
-        # Concatenate embeddings at different layers (0 and l)
+        #---concatenate embeddings at different layers (0 and l)
         cellpos = torch.cat((cellpos, cellfea), 1)
         drugpos = torch.cat((drugpos, drugfea), 1)
         
-        # Inner product with scaled attention
-        pos_adj = torch.matmul(cellpos, drugpos.t()) / np.sqrt(cellpos.size(1))
+        #---inner product
+        pos_adj = torch.matmul(cellpos, drugpos.t())
         pos_adj = self.act(pos_adj)
-        
         return pos_z, neg_z, summary_pos, summary_neg, pos_adj.view(-1)
 
     def discriminate(self, z, summary, sigmoid=True):
@@ -347,39 +262,11 @@ class ImprovedGraphCDR(nn.Module):
         return torch.sigmoid(value) if sigmoid else value
 
     def loss(self, pos_z, neg_z, summary):
-        # Weighted loss with regularization
-        pos_loss = -torch.log(self.discriminate(pos_z, summary, sigmoid=True) + EPS).mean()
-        neg_loss = -torch.log(1 - self.discriminate(neg_z, summary, sigmoid=True) + EPS).mean()
-        
-        # L2 regularization
-        l2_reg = 0.001 * (torch.norm(self.weight) + torch.sum(torch.stack([torch.norm(p) for p in self.parameters()])))
-        
-        return pos_loss + neg_loss + l2_reg
+        pos_loss = -torch.log(
+            self.discriminate(pos_z, summary, sigmoid=True) + EPS).mean()
+        neg_loss = -torch.log(
+            1 - self.discriminate(neg_z, summary, sigmoid=True) + EPS).mean()
+        return pos_loss + neg_loss
 
     def __repr__(self):
         return '{}({})'.format(self.__class__.__name__, self.hidden_channels)
-
-
-# Usage Example
-def create_model(gcn_input_dim, dim_gexp, dim_methy, cell_count, dropout=0.2):
-    # Create the NodeRepresentation module
-    node_rep = NodeRepresentation(
-        gcn_layer=gcn_input_dim,
-        dim_gexp=dim_gexp,
-        dim_methy=dim_methy,
-        output=100,
-        units_list=[256, 256, 256],
-        dropout=dropout,
-        num_heads=4
-    )
-    
-    # Create the Encoder
-    encoder = GATv2Encoder(100, 100, num_heads=4, dropout=dropout)
-    
-    # Create the Summary module
-    summary = AttentionSummary(100, 100)
-    
-    # Create the GraphCDR model
-    model = ImprovedGraphCDR(100, encoder, summary, node_rep, cell_count, dropout=dropout)
-    
-    return model
